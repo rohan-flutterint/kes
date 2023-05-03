@@ -52,7 +52,8 @@ type Manager struct {
 	// the garbage collection stops.
 	CacheContext context.Context
 
-	once  sync.Once // Start the GC only once
+	once  sync.Once  // Start the GC only once
+	getMu sync.Mutex // Prevent concurrent Get access to the Store
 	cache cache
 }
 
@@ -84,6 +85,20 @@ func (m *Manager) Get(ctx context.Context, name string) (Key, error) {
 	if key, ok := m.cache.Get(name); ok {
 		return key, nil
 	}
+
+	// Accquire a lock to prevent multiple concurrent requests
+	// from accessing the Store concurrently. Instead, all
+	// incoming requests get queued up until the first request
+	// finishes.
+	m.getMu.Lock()
+	defer m.getMu.Unlock()
+
+	// Check the cache again. A previous request may have fetched
+	// the key from the Store already while we were blocked.
+	if key, ok := m.cache.Get(name); ok {
+		return key, nil
+	}
+
 	switch key, err := m.Store.Get(ctx, name); {
 	case err == nil:
 		return m.cache.CompareAndSwap(name, key), nil
@@ -129,7 +144,7 @@ func (m *Manager) List(ctx context.Context) (Iterator, error) {
 }
 
 func (m *Manager) startGC() {
-	var ctx = m.CacheContext
+	ctx := m.CacheContext
 	if ctx == nil {
 		ctx = context.Background()
 	}
