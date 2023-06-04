@@ -5,85 +5,69 @@
 package kestest
 
 import (
-	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
-	"net/http"
-	"sync"
 	"time"
 
 	"github.com/minio/kes-go"
 	"github.com/minio/kes/internal/auth"
+	edgeapi "github.com/minio/kes/internal/edge"
 )
 
-// PolicySet holds a set of KES policies and
-// the identity-policy associations.
-type PolicySet struct {
-	admin      kes.Identity
-	policies   map[string]*auth.Policy
-	identities map[kes.Identity]auth.IdentityInfo
+func NewPolicyMap(admin kes.Identity) *PolicyMap {
+	return &PolicyMap{
+		admin: admin,
+		policies: &edgeapi.PolicyMap{
+			Identity: make(map[kes.Identity]string),
+			Policy:   make(map[string]*auth.Policy),
+		},
+	}
 }
 
-// Admin returns the admin Identity that can
-// perform any KES API operation.
-func (p *PolicySet) Admin() kes.Identity { return p.admin }
+type PolicyMap struct {
+	admin    kes.Identity
+	policies *edgeapi.PolicyMap
+}
 
-// Add adds the given KES policy to the PolicySet.
-// Any existing policy with the same name is replaced.
-func (p *PolicySet) Add(name string, policy *kes.Policy) {
-	p.policies[name] = &auth.Policy{
-		Allow:     policy.Allow,
-		Deny:      policy.Deny,
+func (m *PolicyMap) Admin() kes.Identity { return m.admin }
+
+func (m *PolicyMap) Add(name string, policy *kes.Policy) {
+	allow := make(map[string]struct{}, len(policy.Allow))
+	for path := range policy.Allow {
+		allow[path] = struct{}{}
+	}
+	deny := make(map[string]struct{}, len(policy.Deny))
+	for path := range policy.Deny {
+		deny[path] = struct{}{}
+	}
+
+	m.policies.Policy[name] = &auth.Policy{
+		Allow:     allow,
+		Deny:      deny,
 		CreatedAt: time.Now().UTC(),
-		CreatedBy: p.admin,
+		CreatedBy: m.admin,
 	}
 }
 
-// Allow adds a new KES policy that allows the given API
-// patterns to the PolicySet.
-//
-// Allow is a shorthand for first creating a KES Policy
-// and then adding it to the PolicySet.
-func (p *PolicySet) Allow(name string, patterns ...string) {
-	p.Add(name, &kes.Policy{Allow: patterns})
+func (m *PolicyMap) Allow(name string, paths ...string) {
+	allow := make(map[string]kes.Rule, len(paths))
+	for _, path := range paths {
+		allow[path] = struct{}{}
+	}
+	m.Add(name, &kes.Policy{
+		Allow: allow,
+	})
 }
 
-// Assign assigns the KES policy with the given name to
-// all given identities.
-//
-// It returns the first error encountered when assigning
-// identities, if any.
-func (p *PolicySet) Assign(name string, ids ...kes.Identity) error {
+func (m *PolicyMap) Assign(name string, ids ...kes.Identity) {
+	if _, ok := m.policies.Policy[name]; !ok {
+		return
+	}
 	for _, id := range ids {
-		if id.IsUnknown() {
-			return fmt.Errorf("kestest: failed to assign policy %q to %q: identity is empty", name, id)
-		}
-		if id == p.Admin() {
-			return fmt.Errorf("kestest: failed to assign policy %q to %q: equal to admin identity", name, id)
-		}
-		p.identities[id] = auth.IdentityInfo{
-			Policy:    name,
-			CreatedAt: time.Now().UTC(),
-			CreatedBy: p.admin,
-		}
-	}
-	return nil
-}
-
-func (p *PolicySet) policySet() auth.PolicySet {
-	return &policySet{
-		policies: p.policies,
-	}
-}
-
-func (p *PolicySet) identitySet() auth.IdentitySet {
-	return &identitySet{
-		admin:     p.admin,
-		createdAt: time.Now().UTC(),
-		roles:     p.identities,
+		m.policies.Identity[id] = name
 	}
 }
 
@@ -103,150 +87,3 @@ func Identify(cert *tls.Certificate) kes.Identity {
 	id := sha256.Sum256(cert.Leaf.RawSubjectPublicKeyInfo)
 	return kes.Identity(hex.EncodeToString(id[:]))
 }
-
-type policySet struct {
-	lock     sync.RWMutex
-	policies map[string]*auth.Policy
-}
-
-func (p *policySet) Set(_ context.Context, name string, policy *auth.Policy) error {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	p.policies[name] = policy
-	return nil
-}
-
-func (p *policySet) Get(_ context.Context, name string) (*auth.Policy, error) {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
-
-	policy, ok := p.policies[name]
-	if !ok {
-		return nil, kes.ErrPolicyNotFound
-	}
-	return policy, nil
-}
-
-func (p *policySet) Delete(_ context.Context, name string) error {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	delete(p.policies, name)
-	return nil
-}
-
-func (p *policySet) List(_ context.Context) (auth.PolicyIterator, error) {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
-
-	names := make([]string, 0, len(p.policies))
-	for name := range p.policies {
-		names = append(names, name)
-	}
-	return &policyIterator{
-		values: names,
-	}, nil
-}
-
-type policyIterator struct {
-	values  []string
-	current string
-}
-
-func (i *policyIterator) Next() bool {
-	next := len(i.values) > 0
-	if next {
-		i.current = i.values[0]
-		i.values = i.values[1:]
-	}
-	return next
-}
-
-func (i *policyIterator) Name() string { return i.current }
-
-func (i *policyIterator) Close() error { return nil }
-
-type identitySet struct {
-	admin     kes.Identity
-	createdAt time.Time
-
-	lock  sync.RWMutex
-	roles map[kes.Identity]auth.IdentityInfo
-}
-
-func (i *identitySet) Admin(context.Context) (kes.Identity, error) { return i.admin, nil }
-
-func (i *identitySet) SetAdmin(context.Context, kes.Identity) error {
-	return kes.NewError(http.StatusNotImplemented, "cannot set admin identity")
-}
-
-func (i *identitySet) Assign(_ context.Context, policy string, identity kes.Identity) error {
-	if i.admin == identity {
-		return kes.NewError(http.StatusBadRequest, "identity is root")
-	}
-	i.lock.Lock()
-	defer i.lock.Unlock()
-
-	i.roles[identity] = auth.IdentityInfo{
-		Policy:    policy,
-		CreatedAt: time.Now().UTC(),
-	}
-	return nil
-}
-
-func (i *identitySet) Get(_ context.Context, identity kes.Identity) (auth.IdentityInfo, error) {
-	if identity == i.admin {
-		return auth.IdentityInfo{
-			IsAdmin:   true,
-			CreatedAt: i.createdAt,
-		}, nil
-	}
-	i.lock.RLock()
-	defer i.lock.RUnlock()
-
-	policy, ok := i.roles[identity]
-	if !ok {
-		return auth.IdentityInfo{}, kes.ErrIdentityNotFound
-	}
-	return policy, nil
-}
-
-func (i *identitySet) Delete(_ context.Context, identity kes.Identity) error {
-	i.lock.Lock()
-	defer i.lock.Unlock()
-
-	delete(i.roles, identity)
-	return nil
-}
-
-func (i *identitySet) List(_ context.Context) (auth.IdentityIterator, error) {
-	i.lock.RLock()
-	defer i.lock.RUnlock()
-
-	values := make([]kes.Identity, 0, len(i.roles))
-	for identity := range i.roles {
-		values = append(values, identity)
-	}
-	return &identityIterator{
-		values: values,
-	}, nil
-}
-
-type identityIterator struct {
-	values  []kes.Identity
-	current kes.Identity
-}
-
-func (i *identityIterator) Next() bool {
-	next := len(i.values) > 0
-	if next {
-		i.current = i.values[0]
-		i.values = i.values[1:]
-	}
-	return next
-}
-
-func (i *identityIterator) Identity() kes.Identity { return i.current }
-
-func (i *identityIterator) Close() error { return nil }

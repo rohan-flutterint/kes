@@ -11,16 +11,16 @@ import (
 	"context"
 	"errors"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"aead.dev/mem"
 	"github.com/minio/kes-go"
-	"github.com/minio/kes/kv"
+	"github.com/minio/kes/edge/kv"
 )
 
 // NewStore returns a new Store that reads
@@ -152,12 +152,44 @@ func (s *Store) Delete(_ context.Context, name string) error {
 // List returns a Iter over the files within the Conn directory.
 // The Iter must be closed to release any filesystem resources
 // back to the OS.
-func (s *Store) List(ctx context.Context) (kv.Iter[string], error) {
+func (s *Store) List(_ context.Context, prefix string, n int) ([]string, string, error) {
 	dir, err := os.Open(s.dir)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return NewIter(ctx, dir), nil
+	names, err := dir.Readdirnames(-1)
+	if err != nil {
+		return nil, "", err
+	}
+	sort.Strings(names)
+
+	if prefix == "" {
+		if n > 0 && n < len(names) {
+			return names[:n], names[n], nil
+		}
+		return names, "", nil
+	}
+
+	j := -1
+	for i, name := range names {
+		if strings.HasPrefix(name, prefix) {
+			j = i
+			break
+		}
+	}
+	if j < 0 {
+		return []string{}, "", nil
+	}
+
+	for i, name := range names[j:] {
+		if n > 0 && i+j == n {
+			return names[j : j+i], names[i+j], nil
+		}
+		if !strings.HasPrefix(name, prefix) {
+			return names[j : j+i], "", nil
+		}
+	}
+	return names[j:], "", nil
 }
 
 func (s *Store) create(filename string, value []byte) error {
@@ -178,87 +210,6 @@ func (s *Store) create(filename string, value []byte) error {
 		return err
 	}
 	return file.Close()
-}
-
-// Iter is an iterator over all files within a
-// directory. It must be closed to release any
-// filesystem resources.
-type Iter struct {
-	ctx    context.Context
-	dir    fs.ReadDirFile
-	names  []fs.DirEntry
-	err    error
-	closed bool
-}
-
-var _ kv.Iter[string] = (*Iter)(nil)
-
-// NewIter returns an Iter all files within the given
-// directory. The Iter does not iterator recursively
-// into subdirectories.
-func NewIter(ctx context.Context, dir fs.ReadDirFile) *Iter {
-	return &Iter{
-		ctx: ctx,
-		dir: dir,
-	}
-}
-
-// Next reports whether there are more directory entries.
-// It returns false when there are no more entries, the
-// Iter got closed or once it encounters an error.
-//
-// The name of the next directory entry is availbale via
-// the Name method.
-func (i *Iter) Next() (string, bool) {
-	if i.closed || i.err != nil {
-		return "", false
-	}
-	if len(i.names) > 0 {
-		entry := i.names[0]
-		i.names = i.names[1:]
-		return entry.Name(), true
-	}
-
-	if i.ctx != nil {
-		select {
-		case <-i.ctx.Done():
-			if i.err = i.ctx.Err(); i.err == nil {
-				i.err = context.Canceled
-			}
-			return "", false
-		default:
-		}
-	}
-
-	const N = 256
-	i.names, i.err = i.dir.ReadDir(N)
-	if errors.Is(i.err, io.EOF) {
-		i.err = nil
-	}
-	if i.err != nil {
-		i.Close()
-		return "", false
-	}
-	if len(i.names) > 0 {
-		entry := i.names[0]
-		i.names = i.names[1:]
-		return entry.Name(), true
-	}
-	return "", false
-}
-
-// Close closes the Iter and releases and filesystem
-// resources back to the OS.
-func (i *Iter) Close() error {
-	if i.closed {
-		return i.err
-	}
-
-	i.closed = true
-	if err := i.dir.Close(); i.err == nil {
-		i.err = err
-	}
-	return i.err
 }
 
 func validName(name string) error {

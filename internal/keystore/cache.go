@@ -12,10 +12,11 @@ import (
 	"time"
 
 	"github.com/minio/kes-go"
+	"github.com/minio/kes/edge/kv"
 	"github.com/minio/kes/internal/cache"
-	"github.com/minio/kes/internal/key"
+	"github.com/minio/kes/internal/crypto"
 	"github.com/minio/kes/internal/log"
-	"github.com/minio/kes/kv"
+	"github.com/minio/kes/internal/msgp"
 )
 
 // CacheConfig is a structure containing Cache
@@ -117,7 +118,7 @@ type Cache struct {
 	cancelGC func() // Stops the GC
 }
 
-var _ kv.Store[string, key.Key] = (*Cache)(nil)
+var _ kv.Store[string, crypto.SecretKeyVersion] = (*Cache)(nil)
 
 // Stop stops all go routines that periodically
 // remove entries from the Cache.
@@ -133,8 +134,8 @@ func (c *Cache) Status(ctx context.Context) (kv.State, error) {
 // if and only if no entry for the given name exists.
 //
 // If such an entry already exists, Create returns ErrExists.
-func (c *Cache) Create(ctx context.Context, name string, key key.Key) error {
-	b, err := key.MarshalText()
+func (c *Cache) Create(ctx context.Context, name string, key crypto.SecretKeyVersion) error {
+	b, err := msgp.Marshal[msgp.SecretKeyVersion](&key)
 	if err != nil {
 		log.Printf("keystore: failed to encode key '%s': %v", name, err)
 		return errCreateKey
@@ -154,7 +155,7 @@ func (c *Cache) Create(ctx context.Context, name string, key key.Key) error {
 // only if no entry for the given name exists.
 //
 // If such an entry already exists, Set returns ErrExists.
-func (c *Cache) Set(ctx context.Context, name string, key key.Key) error {
+func (c *Cache) Set(ctx context.Context, name string, key crypto.SecretKeyVersion) error {
 	return c.Create(ctx, name, key)
 }
 
@@ -175,20 +176,20 @@ func (c *Cache) Delete(ctx context.Context, name string) error {
 }
 
 // List returns an Iter enumerating the stored keys.
-func (c *Cache) List(ctx context.Context) (kv.Iter[string], error) {
-	iter, err := c.store.List(ctx)
+func (c *Cache) List(ctx context.Context, prefix string, n int) ([]string, string, error) {
+	names, prefix, err := c.store.List(ctx, prefix, n)
 	if err != nil {
 		log.Printf("keystore: failed to list keys: %v", err)
-		return nil, errListKey
+		return nil, "", errListKey
 	}
-	return iter, nil
+	return names, prefix, nil
 }
 
 // Get returns the requested key. Get only fetches the key from the
 // underlying kv.Store if it isn't in the Cache.
 //
 // It returns ErrNotExists if no such entry exists.
-func (c *Cache) Get(ctx context.Context, name string) (key.Key, error) {
+func (c *Cache) Get(ctx context.Context, name string) (crypto.SecretKeyVersion, error) {
 	if entry, ok := c.cache.Get(name); ok {
 		entry.Used.Store(true)
 		return entry.Key, nil
@@ -211,16 +212,16 @@ func (c *Cache) Get(ctx context.Context, name string) (key.Key, error) {
 	b, err := c.store.Get(ctx, name)
 	if err != nil {
 		if errors.Is(err, kes.ErrKeyNotFound) {
-			return key.Key{}, kes.ErrKeyNotFound
+			return crypto.SecretKeyVersion{}, kes.ErrKeyNotFound
 		}
 		log.Printf("keystore: failed to fetch key '%s': %v", name, err)
-		return key.Key{}, errGetKey
+		return crypto.SecretKeyVersion{}, errGetKey
 	}
 
-	k, err := key.Parse(b)
+	k, err := parseSecretKeyVersion(b)
 	if err != nil {
 		log.Printf("keystore: failed to fetch key '%s': %v", name, err)
-		return key.Key{}, errGetKey
+		return crypto.SecretKeyVersion{}, errGetKey
 	}
 
 	e := &entry{
@@ -251,7 +252,7 @@ func (c *Cache) gc(ctx context.Context, interval time.Duration, f func()) {
 
 // A cache entry with a recently used flag.
 type entry struct {
-	Key  key.Key
+	Key  crypto.SecretKeyVersion
 	Used atomic.Bool
 }
 

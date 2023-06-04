@@ -15,7 +15,7 @@ import (
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure/auth"
 	"github.com/minio/kes-go"
-	"github.com/minio/kes/kv"
+	"github.com/minio/kes/edge/kv"
 )
 
 // Credentials are Azure client credentials to authenticate an application
@@ -295,48 +295,21 @@ func (s *Store) Get(ctx context.Context, name string) ([]byte, error) {
 
 // List returns a new Iterator over the names of
 // all stored keys.
-func (s *Store) List(ctx context.Context) (kv.Iter[string], error) {
-	var cancel context.CancelCauseFunc
-	ctx, cancel = context.WithCancelCause(ctx)
-	values := make(chan string, 10)
-
-	go func() {
-		defer close(values)
-
-		var nextLink string
-		for {
-			secrets, link, status, err := s.client.ListSecrets(ctx, nextLink)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				cancel(err)
-				break
-			}
-			if err != nil {
-				cancel(fmt.Errorf("azure: failed to list keys: %v", err))
-				break
-			}
-			if status.StatusCode != http.StatusOK {
-				cancel(fmt.Errorf("azure: failed to list keys: %s (%s)", status.Message, status.ErrorCode))
-				break
-			}
-
-			nextLink = link
-			for _, secret := range secrets {
-				select {
-				case values <- secret:
-				case <-ctx.Done():
-					return
-				}
-			}
-			if nextLink == "" {
-				break
-			}
-		}
-	}()
-	return &iter{
-		ch:     values,
-		ctx:    ctx,
-		cancel: cancel,
-	}, nil
+func (s *Store) List(ctx context.Context, prefix string, n int) ([]string, string, error) {
+	secrets, nextLink, status, err := s.client.ListSecrets(ctx, prefix)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, "", err
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("azure: failed to list keys: %v", err)
+	}
+	if status.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("azure: failed to list keys: %s (%s)", status.Message, status.ErrorCode)
+	}
+	if n > 0 && n < len(secrets) {
+		return secrets[:n], secrets[n], nil
+	}
+	return secrets, nextLink, nil
 }
 
 // ConnectWithCredentials tries to establish a connection to a Azure KeyVault
@@ -378,24 +351,4 @@ func ConnectWithIdentity(_ context.Context, endpoint string, msi ManagedIdentity
 			Authorizer: autorest.NewBearerAuthorizer(token),
 		},
 	}, nil
-}
-
-type iter struct {
-	ch     <-chan string
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-}
-
-func (i *iter) Next() (string, bool) {
-	select {
-	case v, ok := <-i.ch:
-		return v, ok
-	case <-i.ctx.Done():
-		return "", false
-	}
-}
-
-func (i *iter) Close() error {
-	i.cancel(context.Canceled)
-	return context.Cause(i.ctx)
 }

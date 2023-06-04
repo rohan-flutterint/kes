@@ -19,12 +19,14 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"sort"
+	"strings"
 	"time"
 
 	"aead.dev/mem"
 	vaultapi "github.com/hashicorp/vault/api"
 	"github.com/minio/kes-go"
-	"github.com/minio/kes/kv"
+	"github.com/minio/kes/edge/kv"
 )
 
 // Store is a Hashicorp Vault secret store.
@@ -395,9 +397,9 @@ func (s *Store) Delete(ctx context.Context, name string) error {
 
 // List returns a new Iterator over the names of
 // all stored keys.
-func (s *Store) List(ctx context.Context) (kv.Iter[string], error) {
+func (s *Store) List(ctx context.Context, prefix string, n int) ([]string, string, error) {
 	if s.client.Sealed() {
-		return nil, errSealed
+		return nil, "", errSealed
 	}
 
 	// We don't use the Vault SDK vault.Logical.List(string) API
@@ -420,7 +422,7 @@ func (s *Store) List(ctx context.Context) (kv.Iter[string], error) {
 
 	resp, err := s.client.RawRequestWithContext(ctx, r)
 	if err != nil {
-		return nil, fmt.Errorf("vault: failed to list '%s': %v", location, err)
+		return nil, "", fmt.Errorf("vault: failed to list '%s': %v", location, err)
 	}
 	defer resp.Body.Close()
 
@@ -431,10 +433,10 @@ func (s *Store) List(ctx context.Context) (kv.Iter[string], error) {
 	const MaxBody = 32 * mem.MiB
 	secret, err := vaultapi.ParseSecret(mem.LimitReader(resp.Body, MaxBody))
 	if err != nil {
-		return nil, fmt.Errorf("vault: failed to list '%s': %v", location, err)
+		return nil, "", fmt.Errorf("vault: failed to list '%s': %v", location, err)
 	}
 	if secret == nil { // The secret may be nil even when there was no error.
-		return &iterator{}, nil // We return an empty iterator in this case.
+		return []string{}, "", nil // We return an empty iterator in this case.
 	}
 
 	// Vault returns a generic map that should contain
@@ -443,7 +445,22 @@ func (s *Store) List(ctx context.Context) (kv.Iter[string], error) {
 	// of a dedicated type or []string.
 	values, ok := secret.Data["keys"].([]interface{})
 	if !ok {
-		return nil, fmt.Errorf("vault: failed to list '%s': invalid key listing format", location)
+		return nil, "", fmt.Errorf("vault: failed to list '%s': invalid key listing format", location)
 	}
-	return &iterator{values: values}, nil
+
+	var j int
+	names := make([]string, 0, len(values))
+	for _, name := range values {
+		name := fmt.Sprint(name)
+		if strings.HasPrefix(name, prefix) {
+			if n <= 0 && j == n {
+				sort.Strings(names)
+				return names, name, nil
+			}
+			names = append(names, name)
+			j++
+		}
+	}
+	sort.Strings(names)
+	return names, "", nil
 }

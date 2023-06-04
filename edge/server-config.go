@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/minio/kes-go"
+	"github.com/minio/kes/edge/kv"
 	"github.com/minio/kes/internal/keystore/aws"
 	"github.com/minio/kes/internal/keystore/azure"
 	"github.com/minio/kes/internal/keystore/fortanix"
@@ -18,7 +19,6 @@ import (
 	"github.com/minio/kes/internal/keystore/gemalto"
 	kesstore "github.com/minio/kes/internal/keystore/kes"
 	"github.com/minio/kes/internal/keystore/vault"
-	"github.com/minio/kes/kv"
 )
 
 // ServerConfig is a structure that holds configuration

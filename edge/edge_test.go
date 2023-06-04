@@ -9,13 +9,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"os/signal"
 	"testing"
 
 	"github.com/minio/kes-go"
-	"github.com/minio/kes/kv"
+	"github.com/minio/kes/edge/kv"
 )
 
 type SetupFunc func(context.Context, kv.Store[string, []byte], string) error
@@ -168,18 +169,18 @@ func testingContext(t *testing.T) (context.Context, context.CancelFunc) {
 }
 
 func clean(ctx context.Context, store kv.Store[string, []byte], t *testing.T) {
-	iter, err := store.List(ctx)
-	if err != nil {
-		t.Fatalf("Cleanup: failed to list keys: %v", err)
+	iter := kes.ListIter[string]{
+		NextFunc: store.List,
 	}
-	defer iter.Close()
-
 	var names []string
-	for next, ok := iter.Next(); ok; next, ok = iter.Next() {
+	for next, err := iter.Next(ctx); err != io.EOF; next, err = iter.Next(ctx) {
+		if err != nil {
+			t.Errorf("Cleanup: failed to list keys: %v", err)
+		}
 		names = append(names, next)
 	}
 	for _, name := range names {
-		if err = store.Delete(ctx, name); err != nil && !errors.Is(err, kes.ErrKeyNotFound) {
+		if err := store.Delete(ctx, name); err != nil && !errors.Is(err, kes.ErrKeyNotFound) {
 			t.Errorf("Cleanup: failed to delete '%s': %v", name, err)
 		}
 	}

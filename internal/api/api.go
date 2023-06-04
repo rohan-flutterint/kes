@@ -8,32 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/minio/kes-go"
-	"github.com/minio/kes/internal/sys"
 )
-
-// Config is a structure for configuring
-// a KES server API.
-type Config struct {
-	// Timeout is the duration after which a request
-	// times out. If Timeout <= 0 the API default
-	// is used.
-	Timeout time.Duration
-
-	// InsecureSkipAuth controls whether the API verifies
-	// client identities. If InsecureSkipAuth is true,
-	// the API accepts requests from arbitrary identities.
-	// In this mode, the API can be used by anyone who can
-	// communicate to the KES server over HTTPS.
-	// This should only be set for testing or in certain
-	// cases for APIs that don't expose sensitive information,
-	// like metrics.
-	InsecureSkipAuth bool
-}
 
 // API describes a KES server API.
 type API struct {
@@ -59,6 +39,9 @@ type API struct {
 // ServerHTTP takes an HTTP Request and ResponseWriter and executes the
 // API's Handler.
 func (a API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if a.Method == http.MethodPut && r.Method == http.MethodPost {
+		r.Method = http.MethodPut
+	}
 	if r.Method != a.Method {
 		w.Header().Set("Accept", a.Method)
 		Fail(w, kes.NewError(http.StatusMethodNotAllowed, http.StatusText(http.StatusMethodNotAllowed)))
@@ -83,32 +66,66 @@ func (a API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.Handler.ServeHTTP(w, r)
 }
 
-// nameFromRequest strips the API path from the request URL, verifies
-// that the remaining path is a valid name, via verifyName, and returns
-// the remaining path.
-func nameFromRequest(r *http.Request, apiPath string) (string, error) {
-	name := strings.TrimPrefix(r.URL.Path, apiPath)
-	if len(name) == len(r.URL.Path) {
-		return "", fmt.Errorf("api: patch mismatch: received '%s' - expected '%s'", r.URL.Path, apiPath)
+// A HandlerFunc is an adapter that allows the use of
+// ordinary functions as HTTP handlers.
+//
+// In contrast to the http.HandlerFunc type, HandlerFunc
+// returns an error in case of a failed operation.
+type HandlerFunc func(http.ResponseWriter, *http.Request) error
+
+// ServeHTTP calls f(w, r). If f returns a non-nil error
+// HandlerFunc(f) sends the error to the client by calling
+// Fail.
+// If f return nil and does not set a custom response code
+// then ServeHTTP responds with 200 OK and an empty response
+// body.
+func (f HandlerFunc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if err := f(w, r); err != nil {
+		Fail(w, err)
+		return
 	}
-	if err := verifyName(name); err != nil {
-		return "", err
-	}
-	return name, nil
 }
 
-// patternFromRequest strips the API path from the request URL, verifies
-// that the remaining path is a valid pattern, via verifyPattern, and returns
-// the remaining path.
-func patternFromRequest(r *http.Request, apiPath string) (string, error) {
-	pattern := strings.TrimPrefix(r.URL.Path, apiPath)
-	if len(pattern) == len(r.URL.Path) {
-		return "", fmt.Errorf("api: patch mismatch: received '%s' - expected '%s'", r.URL.Path, apiPath)
+const (
+	maxNameLen   = 128
+	maxPrefixLen = 128
+)
+
+func trimPath(url *url.URL, path string, f func(string) error) (string, error) {
+	s := strings.TrimPrefix(url.Path, path)
+	if len(s) == len(url.Path) && path != "" {
+		return "", fmt.Errorf("api: invalid path: '%s' is not a prefix of '%s'", path, url.Path)
 	}
-	if err := verifyPattern(pattern); err != nil {
+	if err := f(s); err != nil {
 		return "", err
 	}
-	return pattern, nil
+	return s, nil
+}
+
+func isValidPrefix(s string) error {
+	if len(s) > maxPrefixLen {
+		return kes.NewError(http.StatusBadRequest, "prefix is too long")
+	}
+	for _, r := range s { // Valid characters are: [ 0-9 , A-Z , a-z , - , _ , * ]
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case r == '-':
+		case r == '_':
+		default:
+			return kes.NewError(http.StatusBadRequest, "prefix contains invalid character")
+		}
+	}
+	return nil
+}
+
+func IsValidName(s string) error {
+	return verifyName(s)
+}
+
+func IsValidPattern(s string) error {
+	return verifyPattern(s)
 }
 
 // verifyName reports whether the name is valid.
@@ -166,40 +183,4 @@ func verifyPattern(pattern string) error {
 		}
 	}
 	return nil
-}
-
-// enclaveFromRequest parses the enclave name from the request URL
-// and returns the corresponding enclave present at the vault.
-func enclaveFromRequest(vault *sys.Vault, req *http.Request) (*sys.Enclave, error) {
-	name := req.URL.Query().Get("enclave")
-	if name == "" {
-		name = sys.DefaultEnclaveName
-	}
-	if err := verifyName(name); err != nil {
-		return nil, err
-	}
-	return vault.GetEnclave(req.Context(), name)
-}
-
-// Sync calls f while holding the given lock and
-// releases the lock once f has been finished.
-//
-// Sync returns the error returned by f, if  any.
-func Sync(locker sync.Locker, f func() error) error {
-	locker.Lock()
-	defer locker.Unlock()
-
-	return f()
-}
-
-// VSync calls f while holding the given lock and
-// releases the lock once f has been finished.
-//
-// VSync returns the result of f and its error
-// if  any.
-func VSync[V any](locker sync.Locker, f func() (V, error)) (V, error) {
-	locker.Lock()
-	defer locker.Unlock()
-
-	return f()
 }

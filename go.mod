@@ -1,6 +1,8 @@
 module github.com/minio/kes
 
-go 1.18
+go 1.20
+
+replace github.com/minio/kes-go => ../kes-go
 
 require (
 	aead.dev/mem v0.2.0
@@ -14,12 +16,14 @@ require (
 	github.com/hashicorp/vault/api v1.5.0
 	github.com/minio/kes-go v0.1.0
 	github.com/minio/selfupdate v0.4.0
-	github.com/muesli/termenv v0.11.1-0.20220204035834-5ac8409525e0
 	github.com/prometheus/client_golang v1.14.0
 	github.com/prometheus/common v0.39.0
 	github.com/spf13/pflag v1.0.5
 	github.com/tinylib/msgp v1.1.7
+	go.etcd.io/bbolt v1.3.7
 	golang.org/x/crypto v0.4.0
+	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df
+	golang.org/x/sync v0.1.0
 	golang.org/x/sys v0.5.0
 	golang.org/x/term v0.5.0
 	google.golang.org/api v0.103.0
@@ -80,6 +84,7 @@ require (
 	github.com/mitchellh/mapstructure v1.4.2 // indirect
 	github.com/mitchellh/reflectwalk v1.0.0 // indirect
 	github.com/muesli/reflow v0.2.1-0.20210115123740-9e1d0d53df68 // indirect
+	github.com/muesli/termenv v0.11.1-0.20220204035834-5ac8409525e0 // indirect
 	github.com/oklog/run v1.0.0 // indirect
 	github.com/philhofer/fwd v1.1.2-0.20210722190033-5c56ac6d0bb9 // indirect
 	github.com/pierrec/lz4 v2.5.2+incompatible // indirect

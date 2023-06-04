@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/minio/kes-go"
-	"github.com/minio/kes/internal/https"
-	"github.com/minio/kes/kv"
+	"github.com/minio/kes/edge/kv"
+	"github.com/minio/kes/internal/mtls"
 )
 
 // Config is a structure containing configuration
@@ -57,13 +57,13 @@ func Connect(ctx context.Context, config *Config) (*Store, error) {
 		return nil, errors.New("kes: no private key provided")
 	}
 
-	cert, err := https.CertificateFromFile(config.Certificate, config.PrivateKey, "")
+	cert, err := mtls.CertificateFromFile(config.Certificate, config.PrivateKey, "")
 	if err != nil {
 		return nil, err
 	}
 	var rootCAs *x509.CertPool
 	if config.CAPath != "" {
-		rootCAs, err = https.CertPoolFromFile(config.CAPath)
+		rootCAs, err = mtls.CertPoolFromFile(config.CAPath)
 		if err != nil {
 			return nil, err
 		}
@@ -153,24 +153,7 @@ func (s *Store) Delete(ctx context.Context, name string) error {
 }
 
 // List returns a new kms.Iter over all stored entries.
-func (s *Store) List(ctx context.Context) (kv.Iter[string], error) {
+func (s *Store) List(ctx context.Context, prefix string, n int) ([]string, string, error) {
 	enclave := s.client.Enclave(s.enclave)
-	i, err := enclave.ListSecrets(ctx, "*")
-	if err != nil {
-		return nil, err
-	}
-	return &iter{i}, nil
+	return enclave.ListSecrets(ctx, prefix, n)
 }
-
-type iter struct {
-	*kes.SecretIter
-}
-
-func (i *iter) Next() (string, bool) {
-	if i.SecretIter.Next() {
-		return i.Name(), true
-	}
-	return "", false
-}
-
-func (i *iter) Close() error { return i.SecretIter.Close() }

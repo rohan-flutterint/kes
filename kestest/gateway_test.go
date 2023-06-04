@@ -12,16 +12,16 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
-	"sort"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/minio/kes-go"
+	"github.com/minio/kes/edge/kv"
 	"github.com/minio/kes/kestest"
-	"github.com/minio/kes/kv"
 )
 
 const ranStringLength = 8
@@ -437,14 +437,22 @@ var getPolicyTests = []struct {
 	{
 		Name: "my-policy2",
 		Policy: &kes.Policy{
-			Allow: []string{"/v1/key/create/*", "/v1/key/generate/*"},
+			Allow: map[string]kes.Rule{
+				"/v1/key/create/*":   {},
+				"/v1/key/generate/*": {},
+			},
 		},
 	},
 	{
 		Name: "my-policy2",
 		Policy: &kes.Policy{
-			Allow: []string{"/v1/key/create/*", "/v1/key/generate/*"},
-			Deny:  []string{"/v1/key/create/my-key2"},
+			Allow: map[string]kes.Rule{
+				"/v1/key/create/*":   {},
+				"/v1/key/generate/*": {},
+			},
+			Deny: map[string]kes.Rule{
+				"/v1/key/create/my-key2": {},
+			},
 		},
 	},
 }
@@ -504,22 +512,14 @@ func testGetPolicy(ctx context.Context, store kv.Store[string, []byte], t *testi
 			if len(policy.Allow) != len(test.Policy.Allow) {
 				t.Fatalf("Test %d: allow policy mismatch: got len %d - want len %d", i, len(policy.Allow), len(test.Policy.Allow))
 			}
-			sort.Strings(test.Policy.Allow)
-			sort.Strings(policy.Allow)
-			for j := range policy.Allow {
-				if policy.Allow[j] != test.Policy.Allow[j] {
-					t.Fatalf("Test %d: allow policy mismatch: got '%s' - want '%s'", i, policy.Allow[j], test.Policy.Allow[j])
-				}
+			if !equal(test.Policy.Allow, policy.Allow) {
+				t.Fatalf("Test %d: allow policy mismatch: got '%v' - want '%v'", i, policy.Allow, test.Policy.Allow)
 			}
 			if len(policy.Deny) != len(test.Policy.Deny) {
 				t.Fatalf("Test %d: deny policy mismatch: got len %d - want len %d", i, len(policy.Deny), len(test.Policy.Deny))
 			}
-			sort.Strings(test.Policy.Deny)
-			sort.Strings(policy.Deny)
-			for j := range policy.Deny {
-				if policy.Deny[j] != test.Policy.Deny[j] {
-					t.Fatalf("Test %d: deny policy mismatch: got '%s' - want '%s'", i, policy.Deny[j], test.Policy.Deny[j])
-				}
+			if !equal(test.Policy.Deny, policy.Deny) {
+				t.Fatalf("Test %d: deny policy mismatch: got '%v' - want '%v'", i, policy.Deny, test.Policy.Deny)
 			}
 		})
 	}
@@ -532,18 +532,18 @@ var selfDescribeTests = []struct {
 		Policy: kes.Policy{},
 	},
 	{ // 1
-		Policy: kes.Policy{Allow: []string{}, Deny: []string{}},
+		Policy: kes.Policy{Allow: map[string]kes.Rule{}, Deny: map[string]kes.Rule{}},
 	},
 	{ // 2
 		Policy: kes.Policy{
-			Allow: []string{
-				"/v1/key/create/my-key-*",
-				"/v1/key/generate/my-key-*",
-				"/v1/key/decrypt/my-key-*",
-				"/v1/key/delete/my-key-*",
+			Allow: map[string]kes.Rule{
+				"/v1/key/create/my-key-*":   {},
+				"/v1/key/generate/my-key-*": {},
+				"/v1/key/decrypt/my-key-*":  {},
+				"/v1/key/delete/my-key-*":   {},
 			},
-			Deny: []string{
-				"/v1/key/delete/my-key-prod-*",
+			Deny: map[string]kes.Rule{
+				"/v1/key/delete/my-key-prod-*": {},
 			},
 		},
 	},
@@ -608,15 +608,12 @@ func testingContext(t *testing.T) (context.Context, context.CancelFunc) {
 	return context.WithCancel(context.Background())
 }
 
-func equal(a, b []string) bool {
+func equal[T any](a, b map[string]T) bool {
 	if len(a) != len(b) {
 		return false
 	}
-
-	sort.Strings(a)
-	sort.Strings(b)
-	for i := range a {
-		if a[i] != b[i] {
+	for path := range a {
+		if _, ok := b[path]; !ok {
 			return false
 		}
 	}
@@ -632,19 +629,20 @@ func mustDecodeB64(s string) []byte {
 }
 
 func clean(ctx context.Context, client *kes.Client, t *testing.T, seed string) {
-	iter, err := client.ListKeys(ctx, fmt.Sprintf("kestest-%s*", seed))
-	if err != nil {
-		t.Fatalf("Cleanup: failed to list keys: %v", err)
+	iter := kes.ListIter[string]{
+		NextFunc: client.ListKeys,
 	}
-	defer iter.Close()
 
-	keysInfo, err := iter.Values(-1)
-	if err != nil {
-		t.Fatalf("Cleanup: failed to iterate keys")
+	var names []string
+	for next, err := iter.Next(ctx); err != io.EOF; next, err = iter.Next(ctx) {
+		if err != nil {
+			t.Errorf("Cleanup: failed to list keys: %v", err)
+		}
+		names = append(names, next)
 	}
-	for _, info := range keysInfo {
-		if err = client.DeleteKey(ctx, info.Name); err != nil && !errors.Is(err, kes.ErrKeyNotFound) {
-			t.Errorf("Cleanup: failed to delete '%s': %v", info.Name, err)
+	for _, name := range names {
+		if err := client.DeleteKey(ctx, name); err != nil && !errors.Is(err, kes.ErrKeyNotFound) {
+			t.Errorf("Cleanup: failed to delete '%s': %v", name, err)
 		}
 	}
 }

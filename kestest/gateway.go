@@ -23,12 +23,12 @@ import (
 	"time"
 
 	"github.com/minio/kes-go"
+	"github.com/minio/kes/edge/kv"
 	"github.com/minio/kes/internal/api"
-	"github.com/minio/kes/internal/auth"
+	"github.com/minio/kes/internal/edge"
 	"github.com/minio/kes/internal/keystore"
 	"github.com/minio/kes/internal/log"
 	"github.com/minio/kes/internal/metric"
-	"github.com/minio/kes/kv"
 )
 
 // NewGateway starts and returns a new Gateway.
@@ -46,11 +46,11 @@ func NewGateway(store kv.Store[string, []byte]) *Gateway {
 type Gateway struct {
 	URL string
 
-	policies *PolicySet
-	client   *kes.Client
-
+	client        *kes.Client
 	caPrivateKey  crypto.PrivateKey
 	caCertificate *x509.Certificate
+
+	policies *PolicyMap
 
 	server *httptest.Server
 }
@@ -63,7 +63,7 @@ func (g *Gateway) Client() *kes.Client { return g.client }
 
 // Policy returns the PolicySet that contains all KES policies
 // and identity-policy associations.
-func (g *Gateway) Policy() *PolicySet { return g.policies }
+func (g *Gateway) Policy() *PolicyMap { return g.policies }
 
 // Close shuts down the Gateway and blocks until all outstanding
 // requests on this server have completed.
@@ -100,11 +100,7 @@ func (g *Gateway) start(kmsStore kv.Store[string, []byte]) {
 		metrics   = metric.New()
 		adminCert = g.IssueClientCertificate("kestest: admin")
 	)
-	g.policies = &PolicySet{
-		admin:      Identify(&adminCert),
-		policies:   make(map[string]*auth.Policy),
-		identities: make(map[kes.Identity]auth.IdentityInfo),
-	}
+	g.policies = NewPolicyMap(Identify(&adminCert))
 
 	auditLog.Add(metrics.AuditEventCounter())
 	errorLog.Add(metrics.ErrorEventCounter())
@@ -114,14 +110,14 @@ func (g *Gateway) start(kmsStore kv.Store[string, []byte]) {
 	})
 
 	serverCert := issueCertificate("kestest: gateway", g.caCertificate, g.caPrivateKey, x509.ExtKeyUsageServerAuth)
-	g.server = httptest.NewUnstartedServer(api.NewEdgeRouter(&api.EdgeRouterConfig{
-		Keys:       store,
-		Policies:   g.policies.policySet(),
-		Identities: g.policies.identitySet(),
-		Proxy:      nil,
-		AuditLog:   auditLog,
-		ErrorLog:   errorLog,
-		Metrics:    metrics,
+	g.server = httptest.NewUnstartedServer(api.NewEdgeRouter(&edge.Node{
+		Admin:    g.policies.admin,
+		Keys:     store,
+		Policies: g.policies.policies,
+		Proxy:    nil,
+		AuditLog: auditLog,
+		ErrorLog: errorLog,
+		Metrics:  metrics,
 	}))
 	g.server.TLS = &tls.Config{
 		RootCAs:      rootCAs,

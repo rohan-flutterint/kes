@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -123,9 +124,8 @@ func migrateCmd(args []string) {
 	defer uiTicker.Stop()
 
 	// Now, we start listing the keys at the source.
-	iterator, err := src.List(ctx)
-	if err != nil {
-		cli.Fatal(err)
+	iter := kes.ListIter[string]{
+		NextFunc: src.List,
 	}
 
 	// Then, we start the UI which prints how many keys have
@@ -145,9 +145,12 @@ func migrateCmd(args []string) {
 
 	// Finally, we start the actual migration.
 	for {
-		name, ok := iterator.Next()
-		if !ok {
+		name, err := iter.Next(ctx)
+		if err == io.EOF {
 			break
+		}
+		if err != nil {
+			cli.Fatalf("failed to list keys: %v", err)
 		}
 		if ok, _ := filepath.Match(pattern, name); !ok {
 			continue
@@ -175,10 +178,6 @@ func migrateCmd(args []string) {
 			cli.Fatalf("failed to migrate %q: %v\nMigrated keys: %d", name, err, atomic.LoadUint64(&n))
 		}
 		atomic.AddUint64(&n, 1)
-	}
-	if err = iterator.Close(); err != nil {
-		quiet.ClearLine()
-		cli.Fatalf("failed to list keys: %v\nMigrated keys: %d", err, atomic.LoadUint64(&n))
 	}
 	cancel()
 

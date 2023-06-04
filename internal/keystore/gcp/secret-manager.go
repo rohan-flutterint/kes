@@ -13,13 +13,14 @@ import (
 	"time"
 
 	"github.com/minio/kes-go"
-	"github.com/minio/kes/kv"
+	"github.com/minio/kes/edge/kv"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	secretmanagerpb "cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
+	gcpiterator "google.golang.org/api/iterator"
 )
 
 // Store is a GCP SecretManager secret store.
@@ -216,11 +217,22 @@ func (s *Store) Delete(ctx context.Context, name string) error {
 
 // List returns a new Iterator over the names of
 // all stored keys.
-func (s *Store) List(ctx context.Context) (kv.Iter[string], error) {
+func (s *Store) List(ctx context.Context, prefix string, n int) ([]string, string, error) {
+	if n <= 0 {
+		n = 0
+	}
 	location := path.Join("projects", s.config.ProjectID)
-	return &iterator{
-		src: s.client.ListSecrets(ctx, &secretmanagerpb.ListSecretsRequest{
-			Parent: location,
-		}),
-	}, nil
+	iter := s.client.ListSecrets(ctx, &secretmanagerpb.ListSecretsRequest{
+		Parent:    location,
+		PageToken: prefix,
+		PageSize:  int32(n),
+	})
+	var names []string
+	for entry, err := iter.Next(); err != gcpiterator.Done; entry, err = iter.Next() {
+		if err != nil {
+			return nil, "", err
+		}
+		names = append(names, path.Base(entry.GetName()))
+	}
+	return names, "", nil
 }

@@ -3,8 +3,8 @@ package kestest_test
 import (
 	"testing"
 
+	"github.com/minio/kes/edge/kv"
 	"github.com/minio/kes/internal/keystore/mem"
-	"github.com/minio/kes/kv"
 )
 
 func TestGatewayMem(t *testing.T) {

@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -19,35 +20,28 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	tui "github.com/charmbracelet/lipgloss"
 	"github.com/minio/kes-go"
-	"github.com/minio/kes/edge"
+	kesconf "github.com/minio/kes/edge"
 	"github.com/minio/kes/internal/api"
 	"github.com/minio/kes/internal/auth"
 	"github.com/minio/kes/internal/cli"
 	"github.com/minio/kes/internal/cpu"
-	"github.com/minio/kes/internal/fips"
+	"github.com/minio/kes/internal/crypto"
+	"github.com/minio/kes/internal/crypto/fips"
+	"github.com/minio/kes/internal/edge"
 	"github.com/minio/kes/internal/https"
-	"github.com/minio/kes/internal/key"
 	"github.com/minio/kes/internal/keystore"
 	"github.com/minio/kes/internal/log"
 	"github.com/minio/kes/internal/metric"
+	"github.com/minio/kes/internal/mtls"
 	"github.com/minio/kes/internal/sys"
 )
 
-type gatewayConfig struct {
-	Address     string
-	ConfigFile  string
-	PrivateKey  string
-	Certificate string
-	TLSAuth     string
-}
-
-func startGateway(cliConfig gatewayConfig) {
+func startEdgeServer(filename, addr string) {
 	var mlock bool
 	if runtime.GOOS == "linux" {
 		mlock = mlockall() == nil
@@ -61,11 +55,11 @@ func startGateway(cliConfig gatewayConfig) {
 	ctx, cancelCtx := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancelCtx()
 
-	config, err := loadGatewayConfig(cliConfig)
+	config, err := loadGatewayConfig(filename, addr)
 	if err != nil {
 		cli.Fatal(err)
 	}
-	tlsConfig, err := newTLSConfig(config, cliConfig.TLSAuth)
+	tlsConfig, err := newTLSConfig(config)
 	if err != nil {
 		cli.Fatal(err)
 	}
@@ -100,12 +94,12 @@ func startGateway(cliConfig gatewayConfig) {
 				return
 			case <-sighup:
 				cli.Println("SIGHUP signal received. Reloading configuration...")
-				config, err := loadGatewayConfig(cliConfig)
+				config, err := loadGatewayConfig(filename, addr)
 				if err != nil {
 					log.Printf("failed to read server config: %v", err)
 					continue
 				}
-				tlsConfig, err := newTLSConfig(config, cliConfig.TLSAuth)
+				tlsConfig, err := newTLSConfig(config)
 				if err != nil {
 					log.Printf("failed to initialize TLS config: %v", err)
 					continue
@@ -143,7 +137,7 @@ func startGateway(cliConfig gatewayConfig) {
 			select {
 			case <-ctx.Done():
 			case <-ticker.C:
-				tlsConfig, err := newTLSConfig(config, cliConfig.TLSAuth)
+				tlsConfig, err := newTLSConfig(config)
 				if err != nil {
 					log.Printf("failed to reload TLS configuration: %v", err)
 					continue
@@ -160,38 +154,38 @@ func startGateway(cliConfig gatewayConfig) {
 	}
 }
 
-func description(config *edge.ServerConfig) (kind string, endpoint []string, err error) {
+func description(config *kesconf.ServerConfig) (kind string, endpoint []string, err error) {
 	if config.KeyStore == nil {
 		return "", nil, errors.New("no KMS backend specified")
 	}
 
 	switch kms := config.KeyStore.(type) {
-	case *edge.FSKeyStore:
+	case *kesconf.FSKeyStore:
 		kind = "Filesystem"
 		if abs, err := filepath.Abs(kms.Path); err == nil {
 			endpoint = []string{abs}
 		} else {
 			endpoint = []string{kms.Path}
 		}
-	case *edge.KESKeyStore:
+	case *kesconf.KESKeyStore:
 		kind = "KES"
 		endpoint = kms.Endpoints
-	case *edge.VaultKeyStore:
+	case *kesconf.VaultKeyStore:
 		kind = "Hashicorp Vault"
 		endpoint = []string{kms.Endpoint}
-	case *edge.FortanixKeyStore:
+	case *kesconf.FortanixKeyStore:
 		kind = "Fortanix SDKMS"
 		endpoint = []string{kms.Endpoint}
-	case *edge.AWSSecretsManagerKeyStore:
+	case *kesconf.AWSSecretsManagerKeyStore:
 		kind = "AWS SecretsManager"
 		endpoint = []string{kms.Endpoint}
-	case *edge.KeySecureKeyStore:
+	case *kesconf.KeySecureKeyStore:
 		kind = "Gemalto KeySecure"
 		endpoint = []string{kms.Endpoint}
-	case *edge.GCPSecretManagerKeyStore:
+	case *kesconf.GCPSecretManagerKeyStore:
 		kind = "GCP SecretManager"
 		endpoint = []string{"Project: " + kms.ProjectID}
-	case *edge.AzureKeyVaultKeyStore:
+	case *kesconf.AzureKeyVaultKeyStore:
 		kind = "Azure KeyVault"
 		endpoint = []string{kms.Endpoint}
 	default:
@@ -200,243 +194,25 @@ func description(config *edge.ServerConfig) (kind string, endpoint []string, err
 	return kind, endpoint, nil
 }
 
-// policySetFromConfig returns an in-memory PolicySet
-// from the given ServerConfig.
-func policySetFromConfig(config *edge.ServerConfig) (auth.PolicySet, error) {
-	policies := &policySet{
-		policies: make(map[string]*auth.Policy),
-	}
-	for name, policy := range config.Policies {
-		if _, ok := policies.policies[name]; ok {
-			return nil, fmt.Errorf("policy %q already exists", name)
-		}
-
-		policies.policies[name] = &auth.Policy{
-			Allow:     policy.Allow,
-			Deny:      policy.Deny,
-			CreatedAt: time.Now().UTC(),
-			CreatedBy: config.Admin,
-		}
-	}
-	return policies, nil
-}
-
-type policySet struct {
-	lock     sync.RWMutex
-	policies map[string]*auth.Policy
-}
-
-var _ auth.PolicySet = (*policySet)(nil) // compiler check
-
-func (p *policySet) Set(_ context.Context, name string, policy *auth.Policy) error {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	p.policies[name] = policy
-	return nil
-}
-
-func (p *policySet) Get(_ context.Context, name string) (*auth.Policy, error) {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
-
-	policy, ok := p.policies[name]
-	if !ok {
-		return nil, kes.ErrPolicyNotFound
-	}
-	return policy, nil
-}
-
-func (p *policySet) Delete(_ context.Context, name string) error {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	delete(p.policies, name)
-	return nil
-}
-
-func (p *policySet) List(_ context.Context) (auth.PolicyIterator, error) {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
-
-	names := make([]string, 0, len(p.policies))
-	for name := range p.policies {
-		names = append(names, name)
-	}
-	return &policyIterator{
-		values: names,
-	}, nil
-}
-
-type policyIterator struct {
-	values  []string
-	current string
-}
-
-var _ auth.PolicyIterator = (*policyIterator)(nil) // compiler check
-
-func (i *policyIterator) Next() bool {
-	next := len(i.values) > 0
-	if next {
-		i.current = i.values[0]
-		i.values = i.values[1:]
-	}
-	return next
-}
-
-func (i *policyIterator) Name() string { return i.current }
-
-func (i *policyIterator) Close() error { return nil }
-
-// identitySetFromConfig returns an in-memory IdentitySet
-// from the given ServerConfig.
-func identitySetFromConfig(config *edge.ServerConfig) (auth.IdentitySet, error) {
-	identities := &identitySet{
-		admin:     config.Admin,
-		createdAt: time.Now().UTC(),
-		roles:     map[kes.Identity]auth.IdentityInfo{},
-	}
-
-	for name, policy := range config.Policies {
-		for _, id := range policy.Identities {
-			if id.IsUnknown() {
-				continue
-			}
-
-			if id == config.Admin {
-				return nil, fmt.Errorf("identity %q is already an admin identity", id)
-			}
-			if _, ok := identities.roles[id]; ok {
-				return nil, fmt.Errorf("identity %q is already assigned", id)
-			}
-			for _, proxyID := range config.TLS.Proxies {
-				if id == proxyID {
-					return nil, fmt.Errorf("identity %q is already a TLS proxy identity", id)
-				}
-			}
-			identities.roles[id] = auth.IdentityInfo{
-				Policy:    name,
-				CreatedAt: time.Now().UTC(),
-				CreatedBy: config.Admin,
-			}
-		}
-	}
-	return identities, nil
-}
-
-type identitySet struct {
-	admin     kes.Identity
-	createdAt time.Time
-
-	lock  sync.RWMutex
-	roles map[kes.Identity]auth.IdentityInfo
-}
-
-var _ auth.IdentitySet = (*identitySet)(nil) // compiler check
-
-func (i *identitySet) Admin(context.Context) (kes.Identity, error) { return i.admin, nil }
-
-func (i *identitySet) SetAdmin(context.Context, kes.Identity) error {
-	return kes.NewError(http.StatusNotImplemented, "cannot set admin identity")
-}
-
-func (i *identitySet) Assign(_ context.Context, policy string, identity kes.Identity) error {
-	if i.admin == identity {
-		return kes.NewError(http.StatusBadRequest, "identity is root")
-	}
-	i.lock.Lock()
-	defer i.lock.Unlock()
-
-	i.roles[identity] = auth.IdentityInfo{
-		Policy:    policy,
-		CreatedAt: time.Now().UTC(),
-		CreatedBy: i.admin,
-	}
-	return nil
-}
-
-func (i *identitySet) Get(_ context.Context, identity kes.Identity) (auth.IdentityInfo, error) {
-	if identity == i.admin {
-		return auth.IdentityInfo{
-			IsAdmin:   true,
-			CreatedAt: i.createdAt,
-		}, nil
-	}
-	i.lock.RLock()
-	defer i.lock.RUnlock()
-
-	policy, ok := i.roles[identity]
-	if !ok {
-		return auth.IdentityInfo{}, kes.ErrIdentityNotFound
-	}
-	return policy, nil
-}
-
-func (i *identitySet) Delete(_ context.Context, identity kes.Identity) error {
-	i.lock.Lock()
-	defer i.lock.Unlock()
-
-	delete(i.roles, identity)
-	return nil
-}
-
-func (i *identitySet) List(_ context.Context) (auth.IdentityIterator, error) {
-	i.lock.RLock()
-	defer i.lock.RUnlock()
-
-	values := make([]kes.Identity, 0, len(i.roles))
-	for identity := range i.roles {
-		values = append(values, identity)
-	}
-	return &identityIterator{
-		values: values,
-	}, nil
-}
-
-type identityIterator struct {
-	values  []kes.Identity
-	current kes.Identity
-}
-
-var _ auth.IdentityIterator = (*identityIterator)(nil) // compiler check
-
-func (i *identityIterator) Next() bool {
-	next := len(i.values) > 0
-	if next {
-		i.current = i.values[0]
-		i.values = i.values[1:]
-	}
-	return next
-}
-
-func (i *identityIterator) Identity() kes.Identity { return i.current }
-
-func (i *identityIterator) Close() error { return nil }
-
-func loadGatewayConfig(gConfig gatewayConfig) (*edge.ServerConfig, error) {
-	file, err := os.Open(gConfig.ConfigFile)
+func loadGatewayConfig(filename, addr string) (*kesconf.ServerConfig, error) {
+	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
-	config, err := edge.ReadServerConfigYAML(file)
+	config, err := kesconf.ReadServerConfigYAML(file)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
-	if gConfig.Address != "" {
-		config.Addr = gConfig.Address
-	}
-	if gConfig.PrivateKey != "" {
-		config.TLS.PrivateKey = gConfig.PrivateKey
-	}
-	if gConfig.Certificate != "" {
-		config.TLS.Certificate = gConfig.Certificate
-	}
 
 	// Set config defaults
+	const DefaultAddr = "0.0.0.0:7373"
+	if addr != "" {
+		config.Addr = addr
+	}
 	if config.Addr == "" {
-		config.Addr = "0.0.0.0:7373"
+		config.Addr = DefaultAddr
 	}
 	if config.Cache.Expiry == 0 {
 		config.Cache.Expiry = 5 * time.Minute
@@ -458,8 +234,8 @@ func loadGatewayConfig(gConfig gatewayConfig) (*edge.ServerConfig, error) {
 	return config, nil
 }
 
-func newTLSConfig(config *edge.ServerConfig, auth string) (*tls.Config, error) {
-	certificate, err := https.CertificateFromFile(config.TLS.Certificate, config.TLS.PrivateKey, config.TLS.Password)
+func newTLSConfig(config *kesconf.ServerConfig) (*tls.Config, error) {
+	certificate, err := mtls.CertificateFromFile(config.TLS.Certificate, config.TLS.PrivateKey, config.TLS.Password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read TLS certificate: %v", err)
 	}
@@ -474,14 +250,14 @@ func newTLSConfig(config *edge.ServerConfig, auth string) (*tls.Config, error) {
 
 	var rootCAs *x509.CertPool
 	if config.TLS.CAPath != "" {
-		rootCAs, err = https.CertPoolFromFile(config.TLS.CAPath)
+		rootCAs, err = mtls.CertPoolFromFile(config.TLS.CAPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read TLS CA certificates: %v", err)
 		}
 	}
 	var clientAuth tls.ClientAuthType
-	switch strings.ToLower(auth) {
-	case "", "on":
+	switch {
+	case false:
 		clientAuth = tls.RequireAndVerifyClientCert
 		if config.API != nil {
 			for _, api := range config.API.Paths {
@@ -491,7 +267,7 @@ func newTLSConfig(config *edge.ServerConfig, auth string) (*tls.Config, error) {
 				}
 			}
 		}
-	case "off":
+	case true:
 		clientAuth = tls.RequireAnyClientCert
 		if config.API != nil {
 			for _, api := range config.API.Paths {
@@ -501,8 +277,6 @@ func newTLSConfig(config *edge.ServerConfig, auth string) (*tls.Config, error) {
 				}
 			}
 		}
-	default:
-		return nil, fmt.Errorf("invalid option for --auth: %s", auth)
 	}
 
 	return &tls.Config{
@@ -517,8 +291,10 @@ func newTLSConfig(config *edge.ServerConfig, auth string) (*tls.Config, error) {
 	}, nil
 }
 
-func newGatewayConfig(ctx context.Context, config *edge.ServerConfig, tlsConfig *tls.Config) (*api.EdgeRouterConfig, error) {
-	rConfig := &api.EdgeRouterConfig{}
+func newGatewayConfig(ctx context.Context, config *kesconf.ServerConfig, tlsConfig *tls.Config) (*edge.Node, error) {
+	rConfig := &edge.Node{
+		Admin: config.Admin,
+	}
 
 	if config.Log.Error {
 		rConfig.ErrorLog = log.New(os.Stderr, "Error: ", log.Ldate|log.Ltime|log.Lmsgprefix)
@@ -548,7 +324,7 @@ func newGatewayConfig(ctx context.Context, config *edge.ServerConfig, tlsConfig 
 	}
 
 	if config.API != nil && len(config.API.Paths) > 0 {
-		rConfig.APIConfig = make(map[string]api.Config, len(config.API.Paths))
+		rConfig.APIConfig = make(map[string]edge.APIConfig, len(config.API.Paths))
 		for k, v := range config.API.Paths {
 			k = strings.TrimSpace(k) // Ensure that the API path starts with a '/'
 			if !strings.HasPrefix(k, "/") {
@@ -558,22 +334,17 @@ func newGatewayConfig(ctx context.Context, config *edge.ServerConfig, tlsConfig 
 			if _, ok := rConfig.APIConfig[k]; ok {
 				return nil, fmt.Errorf("ambiguous API configuration for '%s'", k)
 			}
-			rConfig.APIConfig[k] = api.Config{
+			rConfig.APIConfig[k] = edge.APIConfig{
 				Timeout:          v.Timeout,
 				InsecureSkipAuth: v.InsecureSkipAuth,
 			}
 		}
 	}
-
-	var err error
-	rConfig.Policies, err = policySetFromConfig(config)
+	policies, err := edge.NewPolicyMap(config.Policies, config.Admin)
 	if err != nil {
 		return nil, err
 	}
-	rConfig.Identities, err = identitySetFromConfig(config)
-	if err != nil {
-		return nil, err
-	}
+	rConfig.Policies = policies
 
 	conn, err := config.KeyStore.Connect(ctx)
 	if err != nil {
@@ -586,18 +357,22 @@ func newGatewayConfig(ctx context.Context, config *edge.ServerConfig, tlsConfig 
 	})
 
 	for _, k := range config.Keys {
-		var algorithm kes.KeyAlgorithm
-		if fips.Enabled || cpu.HasAESGCM() {
-			algorithm = kes.AES256_GCM_SHA256
+		var cipher crypto.SecretKeyCipher
+		if fips.Mode > fips.ModeNone || cpu.HasAESGCM() {
+			cipher = kes.AES256
 		} else {
-			algorithm = kes.XCHACHA20_POLY1305
+			cipher = kes.ChaCha20
 		}
 
-		key, err := key.Random(algorithm, config.Admin)
+		key, err := crypto.GenerateSecretKey(cipher, rand.Reader)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create key '%s': %v", k.Name, err)
 		}
-		if err = rConfig.Keys.Create(ctx, k.Name, key); err != nil && !errors.Is(err, kes.ErrKeyExists) {
+		if err = rConfig.Keys.Create(ctx, k.Name, crypto.SecretKeyVersion{
+			Key:       key,
+			CreatedAt: time.Now().UTC(),
+			CreatedBy: config.Admin,
+		}); err != nil && !errors.Is(err, kes.ErrKeyExists) {
 			return nil, fmt.Errorf("failed to create key '%s': %v", k.Name, err)
 		}
 	}
@@ -608,7 +383,7 @@ func newGatewayConfig(ctx context.Context, config *edge.ServerConfig, tlsConfig 
 	return rConfig, nil
 }
 
-func gatewayMessage(config *edge.ServerConfig, tlsConfig *tls.Config, mlock bool) (*cli.Buffer, error) {
+func gatewayMessage(config *kesconf.ServerConfig, tlsConfig *tls.Config, mlock bool) (*cli.Buffer, error) {
 	ip, port := serverAddr(config.Addr)
 	ifaceIPs := listeningOnV4(ip)
 	if len(ifaceIPs) == 0 {
